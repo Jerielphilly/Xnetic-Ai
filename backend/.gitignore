@@ -1,0 +1,14 @@
+# Inside your .gitignore FILE
+
+# Ignore the virtual environment
+.venv/
+
+# Ignore the Firebase service account key
+serviceAccountKey.json
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
+
+# Ignore environment file if you have one
+.env
