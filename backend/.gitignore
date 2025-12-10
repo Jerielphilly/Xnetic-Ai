@@ -1,14 +1,53 @@
-# Inside your .gitignore FILE
-
-# Ignore the virtual environment
-.venv/
-
-# Ignore the Firebase service account key
+# Credentials & Secrets
 serviceAccountKey.json
-
-# Ignore Python cache files
-__pycache__/
-*.pyc
-
-# Ignore environment file if you have one
 .env
+.env.local
+.env.*.local
+google-credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/

@@ -6,6 +6,8 @@ import json
 import uuid
 import datetime
 import traceback
+import logging
+import sys
 from typing import Optional, List
 from dotenv import load_dotenv
 
@@ -28,36 +30,44 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
 from langchain_core.pydantic_v1 import BaseModel, Field
 
-# FIXED: Added missing imports for Text-to-Speech
+# --- GOOGLE CLOUD IMPORTS ---
 from google.cloud import texttospeech
 from google.oauth2 import service_account
 import base64
+
+# --- SETUP LOGGING ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("xnetic-backend")
 
 # --- 1. SETUP & CONFIGURATION ---
 load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
-SERVICE_ACCOUNT_FILE = "serviceAccountKey.json"
+# --- LOAD CREDENTIALS FROM ENVIRONMENT ---
+SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+if not SERVICE_ACCOUNT_FILE:
+    logger.critical("GOOGLE_APPLICATION_CREDENTIALS environment variable not set")
+    sys.exit(1)
+
+if not os.path.exists(SERVICE_ACCOUNT_FILE):
+    logger.critical(f"Service account file not found at: {SERVICE_ACCOUNT_FILE}")
+    sys.exit(1)
+
 try:
-    # Read the project ID from the service account file
     with open(SERVICE_ACCOUNT_FILE, 'r') as f:
         service_account_info = json.load(f)
         PROJECT_ID = service_account_info.get("project_id")
         if not PROJECT_ID:
             raise ValueError("'project_id' not found in service account file.")
-
-    # Create credentials for both Firebase and Google Cloud services
+    
     cred = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE)
     firebase_cred = credentials.Certificate(SERVICE_ACCOUNT_FILE)
-except FileNotFoundError:
-    print("\n\n--- FATAL ERROR ---")
-    print(f"The '{SERVICE_ACCOUNT_FILE}' file was not found in the 'backend' directory.")
-    print("Please make sure the file is present and the server is run from the 'backend' directory.")
-    print("-------------------\n\n")
-    exit()
+    logger.info(f"Successfully loaded credentials for project: {PROJECT_ID}")
+except Exception as e:
+    logger.critical(f"Failed to load credentials: {e}")
+    sys.exit(1)
 
 if not firebase_admin._apps:
-    # FIXED: Explicitly provide the projectId to the initialization function
     firebase_admin.initialize_app(firebase_cred, {
         'storageBucket': 'xnetic.firebasestorage.app',
         'projectId': PROJECT_ID,
@@ -66,17 +76,23 @@ if not firebase_admin._apps:
 db = firestore.client()
 app = FastAPI()
 
+# --- 2. CORS MIDDLEWARE (ENVIRONMENT-DRIVEN) ---
+CORS_ORIGINS_ENV = os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000")
+ALLOWED_ORIGINS = [origin.strip() for origin in CORS_ORIGINS_ENV.split(",") if origin.strip()]
 
-# --- 2. CORS MIDDLEWARE ---
-origins = ["http://localhost:3000"]
+if "*" in ALLOWED_ORIGINS and os.getenv("ENVIRONMENT", "development") == "production":
+    logger.critical("CORS wildcard not allowed in production")
+    sys.exit(1)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
+logger.info(f"CORS configured for origins: {ALLOWED_ORIGINS}")
 
 # --- 3. DATA MODELS FOR AI OUTPUT ---
 class SummaryAnalysis(BaseModel):
@@ -102,7 +118,6 @@ class TimelineEvent(BaseModel):
 
 class Timeline(BaseModel):
     events: List[TimelineEvent] = Field(description="A list of key events and deadlines from the document.")
-# NEW: Data models for the Grammar Check feature
 class GrammarSuggestion(BaseModel):
     original: str = Field(description="The original text snippet with an error.")
     corrected: str = Field(description="The suggested corrected text.")
@@ -110,17 +125,37 @@ class GrammarSuggestion(BaseModel):
 
 class GrammarReport(BaseModel):
     suggestions: List[GrammarSuggestion] = Field(description="A list of grammar and style suggestions.")
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+ 
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
 
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", 25)) * 1024 * 1024
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt"}
 # --- 4. AUTHENTICATION & HELPERS ---
 async def get_current_user(authorization: Optional[str] = Header(None)):
-    if authorization is None:
+    if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization Header")
+
     try:
-        token = authorization.split("Bearer ")[1]
-        return auth.verify_id_token(token)
-    except Exception as e:
-        print(f"Auth Error: {e}")
+        if authorization.startswith("Bearer "):
+            token = authorization[len("Bearer "):].strip()
+        else:
+            token = authorization.strip()
+
+        if not token:
+            raise HTTPException(status_code=401, detail="Empty token")
+
+        decoded = auth.verify_id_token(token)
+        return decoded
+    except auth.AuthError as e:
+        logger.warning("Auth verification failed")
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+    except Exception:
+        logger.exception("Unexpected auth error")
+        raise HTTPException(status_code=401, detail="Authentication failed")
 
 def get_document_text(file_bytes: bytes, filename: str, with_page_numbers: bool = False):
     text = ""
@@ -165,15 +200,40 @@ async def upload_document(
     file_paths = []
 
     for file in files:
+        filename = file.filename or "upload"
+        ext = os.path.splitext(filename.lower())[1]
+        if ext not in ALLOWED_EXTENSIONS:
+           raise HTTPException(
+               status_code=400,
+               detail=f"Unsupported file type '{ext}'. Allowed: {list(ALLOWED_EXTENSIONS)}"
+           )
+       
         file_bytes = await file.read()
+       
+        if len(file_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File exceeds max size ({MAX_UPLOAD_BYTES / 1024 / 1024:.0f} MB)"
+            )
+       
+        safe_filename = re.sub(r'[^a-zA-Z0-9._-]', '_', filename)
+       
         bucket = storage.bucket()
-        unique_filename = f"{user_id}/{uuid.uuid4()}_{file.filename}"
+        unique_filename = f"{user_id}/{uuid.uuid4()}_{safe_filename}"
         blob = bucket.blob(unique_filename)
         blob.upload_from_string(file_bytes, content_type=file.content_type)
-        blob.make_public()
 
-        document_names.append(file.filename)
-        file_urls.append(blob.public_url)
+        document_names.append(safe_filename)
+        try:
+           signed_url = blob.generate_signed_url(
+               version="v4",
+               expiration=datetime.timedelta(hours=1),
+               method="GET"
+           )
+        except Exception as e:
+           logger.error(f"Failed to generate signed URL: {e}")
+           signed_url = None
+        file_urls.append(signed_url)
         file_paths.append(unique_filename)
 
         summary_text = get_document_text(file_bytes, file.filename, with_page_numbers=False)
@@ -187,7 +247,7 @@ async def upload_document(
         raise HTTPException(status_code=400, detail="None of the provided files could be processed.")
 
     try:
-        model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.3)
+        model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.3)
         parser = JsonOutputParser(pydantic_object=SummaryAnalysis)
         summary_prompt_template =  """
 You are an expert assistant creating structured document summaries tailored to the role: {role}.
@@ -224,7 +284,6 @@ DOCUMENT TEXT:
             "documentName": document_names,
             "documentTitle": ai_response_json.get("documentTitle"),
             "createdAt": datetime.datetime.now(datetime.timezone.utc),
-            # FIXED: Re-added rawText to the document for other features to use
             "rawText": combined_raw_text_with_pages,
             "role": role,
             "fileUrl": file_urls,
@@ -240,9 +299,10 @@ DOCUMENT TEXT:
         
         return { "document_id": doc_ref.id, **ai_response_json }
 
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="An internal error occurred during analysis.")
+    except Exception as e:
+        logger.exception(f"upload_document failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 @app.post("/ask")
 async def ask_question(request: dict, current_user: dict = Depends(get_current_user)):
     user_id = current_user["uid"]
@@ -260,10 +320,9 @@ async def ask_question(request: dict, current_user: dict = Depends(get_current_u
         if chat_data.get("userId") != user_id:
             raise HTTPException(status_code=403, detail="Permission denied.")
         
-        # For Q&A, we need to reconstruct the full text from storage
         raw_text_for_qa = ""
         file_paths = chat_data.get("filePath", [])
-        if isinstance(file_paths, str): # Handle older single-file chats
+        if isinstance(file_paths, str): 
              file_paths = [file_paths]
 
         for path in file_paths:
@@ -275,7 +334,7 @@ async def ask_question(request: dict, current_user: dict = Depends(get_current_u
         if not raw_text_for_qa:
             raise HTTPException(status_code=404, detail="No text found to analyze.")
 
-        model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.3)
+        model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.3)
         prompt_template = """
         You are a helpful and versatile legal assistant. Your primary goal is to answer questions based *only* on the provided 'Context' from a legal document.
 
@@ -296,9 +355,9 @@ async def ask_question(request: dict, current_user: dict = Depends(get_current_u
         chain = prompt | model | StrOutputParser()
         answer = chain.invoke({"context": raw_text_for_qa, "question": question})
         return {"answer": answer}
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="An internal error occurred.")
+    except Exception as e:
+        logger.exception(f"[ENDPOINT NAME] failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.delete("/chats/{chatId}")
 async def delete_chat(chatId: str, current_user: dict = Depends(get_current_user)):
@@ -328,9 +387,9 @@ async def delete_chat(chatId: str, current_user: dict = Depends(get_current_user
         db.collection("chatFolders").document(chatId).delete()
 
         return {"status": "success", "message": "Chat deleted successfully."}
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="An internal error occurred.")
+    except Exception as e:
+        logger.exception(f"[ENDPOINT NAME] failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/negotiate")
 async def negotiate_clause(request: dict, current_user: dict = Depends(get_current_user)):
@@ -350,7 +409,7 @@ async def negotiate_clause(request: dict, current_user: dict = Depends(get_curre
             raise HTTPException(status_code=403, detail="Permission denied.")
         role = chat_data.get("role", "user")
 
-        model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.5)
+        model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.5)
         negotiation_prompt_template = """
         You are a professional legal negotiator. Redraft the 'Unfair Clause' to be more balanced from the perspective of a **{role}**.
         Provide the actual re-drafted text and briefly explain why it's fairer in Markdown.
@@ -363,9 +422,9 @@ async def negotiate_clause(request: dict, current_user: dict = Depends(get_curre
         chain = prompt | model | StrOutputParser()
         suggestion = chain.invoke({"role": role, "original_clause": original_clause})
         return {"suggestion": suggestion}
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="An internal error occurred.")
+    except Exception as e:
+        logger.exception(f"[ENDPOINT NAME] failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/extract-clauses")
 async def extract_clauses(request: dict, current_user: dict = Depends(get_current_user)):
@@ -400,7 +459,7 @@ async def extract_clauses(request: dict, current_user: dict = Depends(get_curren
         if not text_to_analyze:
             raise HTTPException(status_code=404, detail="No text found to analyze in the specified file.")
 
-        model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.1)
+        model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.1)
         parser = JsonOutputParser(pydantic_object=ClauseList)
 
         extraction_prompt_template = """
@@ -421,9 +480,9 @@ async def extract_clauses(request: dict, current_user: dict = Depends(get_curren
         
         return clauses_json
         
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="An internal error occurred.")
+    except Exception as e:
+        logger.exception(f"[ENDPOINT NAME] failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/translate")
 async def translate_document(request: dict, current_user: dict = Depends(get_current_user)):
@@ -457,7 +516,7 @@ async def translate_document(request: dict, current_user: dict = Depends(get_cur
         if not text_to_translate:
             raise HTTPException(status_code=404, detail="No text found to translate.")
 
-        model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.2)
+        model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.2)
         translation_prompt_template = """
         You are a professional document translator. Your task is to translate the following 'DOCUMENT TEXT' into **{target_language}**.
         **Crucial Formatting Rules:**
@@ -477,9 +536,9 @@ async def translate_document(request: dict, current_user: dict = Depends(get_cur
         
         return {"translated_text": translated_text}
         
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="An internal error during translation.")
+    except Exception as e:
+        logger.exception(f"[ENDPOINT NAME] failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/folders")
 async def create_folder(request: dict, current_user: dict = Depends(get_current_user)):
@@ -497,9 +556,9 @@ async def create_folder(request: dict, current_user: dict = Depends(get_current_
         folder_ref = db.collection("folders").document()
         folder_ref.set(folder_data)
         return {"folder_id": folder_ref.id, **folder_data}
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Could not create folder.")
+    except Exception as e:
+        logger.exception(f"[ENDPOINT NAME] failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/folders")
 async def get_folders(current_user: dict = Depends(get_current_user)):
@@ -530,9 +589,9 @@ async def get_folders(current_user: dict = Depends(get_current_user)):
 
         return {"folders": folders, "uncategorized": uncategorized_chats}
 
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Could not retrieve folders.")
+    except Exception as e:
+        logger.exception(f"[ENDPOINT NAME] failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/move-chat")
 async def move_chat_to_folder(request: dict, current_user: dict = Depends(get_current_user)):
@@ -561,9 +620,9 @@ async def move_chat_to_folder(request: dict, current_user: dict = Depends(get_cu
             mapping_ref.delete()
             
         return {"status": "success", "message": f"Chat {chat_id} moved."}
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Could not move chat.")
+    except Exception as e:
+        logger.exception(f"[ENDPOINT NAME] failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.delete("/folders/{folderId}")
 async def delete_folder(folderId: str, current_user: dict = Depends(get_current_user)):
@@ -582,9 +641,9 @@ async def delete_folder(folderId: str, current_user: dict = Depends(get_current_
 
         folder_ref.delete()
         return {"status": "success", "message": "Folder deleted successfully."}
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="An internal error occurred.")
+    except Exception as e:
+        logger.exception(f"[ENDPOINT NAME] failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.patch("/chats/{chatId}")
 async def rename_chat(chatId: str, request: dict, current_user: dict = Depends(get_current_user)):
@@ -603,9 +662,9 @@ async def rename_chat(chatId: str, request: dict, current_user: dict = Depends(g
         
         doc_ref.update({"documentTitle": new_title})
         return {"status": "success", "message": "Chat renamed."}
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Could not rename chat.")
+    except Exception as e:
+        logger.exception(f"[ENDPOINT NAME] failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.patch("/folders/{folderId}")
 async def rename_folder(folderId: str, request: dict, current_user: dict = Depends(get_current_user)):
@@ -624,9 +683,9 @@ async def rename_folder(folderId: str, request: dict, current_user: dict = Depen
 
         doc_ref.update({"folderName": new_name})
         return {"status": "success", "message": "Folder renamed."}
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Could not rename folder.")
+    except Exception as e:
+        logger.exception(f"[ENDPOINT NAME] failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 @app.post("/text-to-speech")
 async def text_to_speech_endpoint(request: dict):
     text_to_speak = request.get("text")
@@ -634,7 +693,6 @@ async def text_to_speech_endpoint(request: dict):
         raise HTTPException(status_code=400, detail="No text provided.")
 
     try:
-        # FIXED: Explicitly pass the loaded Google Cloud credentials to the client.
         client = texttospeech.TextToSpeechClient(credentials=cred)
         
         synthesis_input = texttospeech.SynthesisInput(text=text_to_speak)
@@ -676,12 +734,11 @@ async def generate_timeline(request: dict, current_user: dict = Depends(get_curr
         if chat_data.get("userId") != user_id:
             raise HTTPException(status_code=403, detail="Permission denied.")
 
-        # Use the raw text stored in Firestore
         full_text = chat_data.get("rawText")
         if not full_text:
             raise HTTPException(status_code=404, detail="No text found in the document to generate a timeline.")
 
-        model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.1)
+        model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.1)
         parser = JsonOutputParser(pydantic_object=Timeline)
 
         current_date = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -719,18 +776,16 @@ DOCUMENT TEXT:
 
         chain = prompt | model | parser
 
-        # Invoke LLM
         timeline_json = chain.invoke({"text": full_text, "current_date": current_date})
 
-        # If Timeline model has events, sort them
         if hasattr(timeline_json, "events") and timeline_json.events:
             timeline_json.events.sort(key=lambda x: x.date)
 
         return timeline_json
 
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="An internal error occurred while generating the timeline.")
+    except Exception as e:
+        logger.exception(f"[ENDPOINT NAME] failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.patch("/chats/{chatId}/timeline")
 async def save_timeline_progress(chatId: str, request: dict, current_user: dict = Depends(get_current_user)):
@@ -750,9 +805,9 @@ async def save_timeline_progress(chatId: str, request: dict, current_user: dict 
         
         doc_ref.update({"completedTimelineEvents": completed_events})
         return {"status": "success", "message": "Timeline progress saved."}
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Could not save timeline progress.")
+    except Exception as e:
+        logger.exception(f"[ENDPOINT NAME] failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/check-grammar")
 async def check_grammar(request: dict, current_user: dict = Depends(get_current_user)):
@@ -785,10 +840,9 @@ async def check_grammar(request: dict, current_user: dict = Depends(get_current_
         if not text_to_analyze:
             raise HTTPException(status_code=404, detail="No text found to analyze in the specified file.")
 
-        model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.1)
+        model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.1)
         parser = JsonOutputParser(pydantic_object=GrammarReport)
 
-        # FIXED: Updated prompt to be more specific and ignore formatting issues.
         grammar_prompt_template = """
         You are an expert proofreader. Your task is to analyze the provided 'DOCUMENT TEXT' for substantive issues.
 
@@ -840,7 +894,7 @@ async def check_grammar(request: dict, current_user: dict = Depends(get_current_
         
         return grammar_report
         
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="An internal error occurred while checking grammar.")
+    except Exception as e:
+        logger.exception(f"[ENDPOINT NAME] failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
