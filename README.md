@@ -415,7 +415,7 @@ Response:
   }
 ```
 
-**Full API documentation available at `http://localhost:8000/docs` (Swagger UI)**
+
 
 ---
 
@@ -566,22 +566,6 @@ firebase deploy --only hosting
 
 ---
 
-## 🤝 Contributing
-
-Contributions are welcome! Please follow these steps:
-
-1. **Fork the repository**
-2. **Create a feature branch:** `git checkout -b feature/your-feature`
-3. **Commit changes:** `git commit -m "Add your feature"`
-4. **Push to branch:** `git push origin feature/your-feature`
-5. **Open a Pull Request** with a clear description
-
-### Code Standards
-- **Python:** PEP 8, type hints where possible
-- **JavaScript/TypeScript:** Prettier, ESLint rules enforced
-- **Commits:** Conventional Commits format preferred
-
----
 
 ## 📄 License
 
@@ -593,20 +577,6 @@ This project is licensed under the **MIT License** — see LICENSE file for deta
 
 - **Issues:** [GitHub Issues](https://github.com/Jerielphilly/Xnetic-Ai/issues)
 - **Discussions:** [GitHub Discussions](https://github.com/Jerielphilly/Xnetic-Ai/discussions)
-- **Email:** [contact@xnetic.ai](mailto:contact@xnetic.ai)
-
----
-
-## 🎯 Roadmap
-
-- [ ] Multi-language UI (i18n)
-- [ ] Document comparison (side-by-side)
-- [ ] Batch upload & analysis
-- [ ] Integration with e-signature platforms (DocuSign, HelloSign)
-- [ ] Custom AI model fine-tuning
-- [ ] Mobile app (React Native)
-- [ ] Advanced permission model (team collaboration)
-- [ ] Audit logs & compliance exports
 
 ---
 
@@ -619,5 +589,5 @@ This project is licensed under the **MIT License** — see LICENSE file for deta
 
 ---
 
-**Made with ❤️ by [Your Name/Team]**  
+**Made with ❤️ by Jeriel Philly**  
 *Simplifying legal complexity, one document at a time.*
